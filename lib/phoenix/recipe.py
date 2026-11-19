@@ -19,6 +19,7 @@ import signal
 import time
 import datetime
 import glob
+import shlex
 import shutil
 import tempfile
 import phoenix
@@ -295,6 +296,8 @@ class Recipe(object):
                             self.artifacts.append(ArtifactInitramfs())
                         elif artifacttype == 'squashfs':
                             self.artifacts.append(ArtifactSquashfs(artifact['squashfs']))
+                        elif artifacttype == 'uki':
+                            self.artifacts.append(ArtifactUki(artifact['uki']))
                         elif artifacttype == 'push':
                             self.artifacts.append(ArtifactPush(artifact['push'], self))
                         else:
@@ -400,6 +403,13 @@ class Recipe(object):
         self.image = image
         return image
 
+    def outputdir(self):
+        """ The artifact directory for this build, created on first use.
+        """
+        outputdir = Path(phoenix.artifact_path) / 'images' / self.name / self.tag
+        outputdir.mkdir(parents=True, exist_ok=True)
+        return outputdir
+
     def taglatest(self):
         latestlink = Path(phoenix.artifact_path) / 'images' / self.name / 'latest'
         if latestlink.is_symlink():
@@ -421,6 +431,8 @@ class Recipe(object):
         if self.initfrom == "scratch" and len(self.initpackages) == 0:
             logging.error("You must specify initpackages when building from scratch")
             return
+        for artifact in self.artifacts:
+            artifact.check()
         logging.info("Building recipe %s with tag %s", self.name, self.tag)
 
         with ConfirmKeyboardInterrupt():
@@ -811,7 +823,12 @@ class StepOsRelease(Step):
             raise RuntimeError
 
 class Artifact(object):
-    pass
+    def check(self):
+        """ Verify the build host can produce this artifact. Runs before the
+            image is built so a missing tool fails fast rather than after a
+            long build.
+        """
+        pass
 
 class ArtifactFile(Artifact):
     name = 'File'
@@ -833,8 +850,7 @@ class ArtifactFile(Artifact):
     def run(self, recipe):
         # TODO: Make sure the resulting glob doesn't escape the container root
         #       Not really a security issue, as users shouldn't run untrusted recipes
-        outputdir = Path(phoenix.artifact_path) / 'images' / recipe.name / recipe.tag
-        outputdir.mkdir(parents=True, exist_ok=True)
+        outputdir = recipe.outputdir()
         logging.info("Saving artifact '%s' to %s", self.pattern, outputdir)
 
         outputpath = outputdir / self.dst if self.dst else outputdir
@@ -861,8 +877,7 @@ class ArtifactInitramfs(Artifact):
         return "True"
 
     def run(self, recipe):
-        outputdir = Path(phoenix.artifact_path) / 'images' / recipe.name / recipe.tag
-        outputdir.mkdir(parents=True, exist_ok=True)
+        outputdir = recipe.outputdir()
         cpiocommand = "find . | cpio --quiet -H newc -o | pigz -9 -n > %s/initramfs.gz" % outputdir
         logging.info("Saving image root as initramfs artifact")
         command = [ "/bin/bash",
@@ -894,8 +909,7 @@ class ArtifactSquashfs(Artifact):
         return "True"
 
     def run(self, recipe):
-        outputdir = Path(phoenix.artifact_path) / 'images' / recipe.name / recipe.tag
-        outputdir.mkdir(parents=True, exist_ok=True)
+        outputdir = recipe.outputdir()
         if len(self.include) > 0:
             squashcommand = "mksquashfs %s %s/%s -no-strip" % (" ".join(self.include), outputdir, self.output)
         else:
@@ -911,6 +925,476 @@ class ArtifactSquashfs(Artifact):
             raise RuntimeError
         else:
             logging.info("Created %s/%s", outputdir, self.output)
+
+class ArtifactUki(Artifact):
+    """ Build a Unified Kernel Image, a single EFI binary holding the kernel,
+        the initrd, the kernel command line, and os-release, suitable for
+        HTTP Boot without iPXE.
+
+        Accepts a string, taken as the url, or a mapping:
+
+          output:   the artifact filename, defaults to 'uki.efi'. The
+                    artifact directory is already keyed by image name and
+                    tag, so the default is deliberately constant to keep the
+                    boot URL predictable.
+          url:      base URL the nodes fetch artifacts from, for example
+                    http://boot.example.com:8000. Used to build the live
+                    root argument.
+          squashfs: the squashfs filename to boot. Defaults to the output of
+                    the recipe's squashfs artifact.
+          kcmdline: a string or list of extra kernel parameters. The live
+                    root and a generic DHCP configuration are supplied
+                    automatically unless this already sets them.
+          kver:     the kernel version. Defaults to the sole entry in
+                    /lib/modules, an error if the image holds more than one.
+          kernel:   the kernel image, a path or glob relative to the image
+                    root. Defaults to the first of lib/modules/<kver>/vmlinuz,
+                    boot/vmlinuz-<kver>, and boot/Image-<kver> that exists.
+          initrd:   reuse an existing initrd from the image rather than
+                    building one. A path or glob relative to the image root.
+          dracutmodules: dracut modules to add, replacing the default of the
+                    ones a live network root needs
+          dracutargs: extra arguments for the dracut invocation
+          stub:     the sd-stub to wrap, defaults to the one in the image
+                    for the target architecture
+          key/cert: PEM private key and certificate to sign with, both
+                    required together. Paths are on the build host, not in
+                    the image. Signing is optional so that an image can be
+                    built and tested before any keys exist.
+          signkernel: also sign the kernel inside the UKI, default true
+                    when signing
+          signtool: ukify signing backend, 'systemd-sbsign' or 'sbsign'
+
+        The initrd is built inside the container so the image's own kernel
+        modules and dracut modules are the ones dracut finds, but ukify runs
+        on the build host so the signing key never enters the image root,
+        where a later squashfs or push artifact could capture it.
+    """
+    name = 'UKI'
+
+    # The artifact directory is already images/<name>/<tag>/, so a constant
+    # filename makes the HTTP Boot URL a function of image and tag alone.
+    def_output = 'uki.efi'
+
+    keys = ('output', 'url', 'squashfs', 'kcmdline', 'kver', 'kernel',
+            'initrd', 'dracutmodules', 'dracutargs', 'stub', 'key', 'cert',
+            'signkernel', 'signtool')
+
+    # dracut names the sd-stub after the EFI machine type, not the kernel
+    # architecture. Mirrors the mapping in dracut itself.
+    efiarch = {'x86_64': 'x64', 'i386': 'ia32', 'i686': 'ia32',
+               'aarch64': 'aa64', 'riscv64': 'riscv64'}
+
+    # RHEL and Fedora ship the kernel beside its modules, SLES only in /boot.
+    kernelpaths = ('lib/modules/%s/vmlinuz', 'boot/vmlinuz-%s', 'boot/Image-%s')
+
+    osreleasepaths = ('etc/os-release', 'usr/lib/os-release')
+
+    signtools = ('systemd-sbsign', 'sbsign')
+
+    # Fetching the root over HTTP needs the live root modules and a network
+    # brought up in the initrd.
+    def_dracutmodules = ['dmsquash-live', 'livenet']
+
+    # Bring up every interface with DHCP and keep whichever one answers. The
+    # point of a UKI here is that it is not built per node, so nothing in the
+    # default may name a specific interface or address. A recipe that knows
+    # which interfaces its nodes boot on should say so in kcmdline.
+    def_netcmdline = ['ip=dhcp', 'rd.neednet=1']
+
+    # Any of these in kcmdline means the recipe is configuring the network
+    # itself, so the generic DHCP default is left out.
+    netargs = ('ip=', 'bond=', 'vlan=', 'bridge=', 'team=', 'bootdev=',
+               'BOOTIF=', 'rd.neednet=')
+
+    # Where the host scratch directory appears inside the container.
+    scratchmount = '/run/phoenix-uki'
+
+    def __init__(self, params):
+        self.output = self.def_output
+        self.url = None
+        self.squashfs = None
+        self.kver = None
+        self.kernel = None
+        self.initrd = None
+        self.stub = None
+        self.key = None
+        self.cert = None
+        self.signkernel = None
+        self.signtool = 'systemd-sbsign'
+        self.kcmdline = []
+        self.dracutmodules = list(self.def_dracutmodules)
+        self.dracutargs = []
+
+        if isinstance(params, str):
+            params = {'url': params}
+        elif type(params) is not dict:
+            logging.error("UKI artifact must be a url or a mapping, got %r", params)
+            raise RuntimeError
+
+        for key in params:
+            if key not in self.keys:
+                logging.warning("UKI artifact option '%s' not understood", key)
+
+        self.output = params.get('output', self.output)
+        self.url = params.get('url')
+        self.squashfs = params.get('squashfs')
+        self.kver = params.get('kver')
+        self.kernel = params.get('kernel')
+        self.initrd = params.get('initrd')
+        self.stub = params.get('stub')
+        self.key = params.get('key')
+        self.cert = params.get('cert')
+        self.signkernel = params.get('signkernel')
+        self.signtool = params.get('signtool', self.signtool)
+        if 'kcmdline' in params:
+            self.kcmdline = self._tokenize(params['kcmdline'], 'kcmdline')
+        if 'dracutmodules' in params:
+            self.dracutmodules = self._tokenize(params['dracutmodules'], 'dracutmodules')
+        if 'dracutargs' in params:
+            self.dracutargs = self._tokenize(params['dracutargs'], 'dracutargs', shell=True)
+
+        if self.initrd and ('dracutmodules' in params or 'dracutargs' in params):
+            logging.warning("UKI 'dracutmodules' and 'dracutargs' are ignored with 'initrd'")
+
+        if self.signtool not in self.signtools:
+            logging.error("UKI signtool %s is not one of %s", self.signtool,
+                          ", ".join(self.signtools))
+            raise RuntimeError
+
+        # Signing with only one half of the pair would silently produce an
+        # unsigned image, which is worse than refusing to build.
+        if bool(self.key) != bool(self.cert):
+            logging.error("UKI artifact needs both 'key' and 'cert' to sign, got only %s",
+                          'key' if self.key else 'cert')
+            raise RuntimeError
+
+        if self.signkernel is None:
+            self.signkernel = bool(self.key)
+        elif self.signkernel and not self.key:
+            logging.error("UKI 'signkernel' needs a 'key' and 'cert' to sign with")
+            raise RuntimeError
+
+        # A UKI with no root= never boots, and the failure only shows up on
+        # a node, so catch it while building.
+        if self.url is None and not self._hasarg(self.kcmdline, ('root=',)):
+            logging.error("UKI artifact needs a 'url' to build the live root from, "
+                          "or a root= in its kcmdline")
+            raise RuntimeError
+
+    def check(self):
+        if shutil.which('ukify') is None:
+            logging.error("UKI artifact needs ukify, from systemd-ukify, on the build host")
+            raise RuntimeError
+        for path, what in ((self.key, 'key'), (self.cert, 'cert')):
+            if path and not os.access(path, os.R_OK):
+                logging.error("UKI %s %s is not readable", what, path)
+                raise RuntimeError
+
+    @staticmethod
+    def _tokenize(value, what, shell=False):
+        """ Accept a list of parameters or a string holding several.
+
+            'shell' splits a string the way a shell would, for the settings
+            that become an argument vector, so a value containing spaces can
+            be quoted into one argument and the quotes are then consumed.
+
+            Without it the string is split the way the kernel splits its own
+            command line, on whitespace outside of double quotes, and each
+            parameter keeps its text exactly as written. The kernel does its
+            own parsing of what it is handed, so quotes have to survive this
+            intact and the spacing inside them has to be left alone.
+        """
+        if type(value) is list:
+            items = value
+        elif isinstance(value, str):
+            if shell:
+                try:
+                    items = shlex.split(value)
+                except ValueError as e:
+                    logging.error("UKI %s is not parseable as a command line: %s", what, e)
+                    raise RuntimeError
+            else:
+                items = ArtifactUki._splitcmdline(value)
+        else:
+            logging.error("UKI %s must be a string or list, got %r", what, value)
+            raise RuntimeError
+        return [str(item) for item in items]
+
+    @staticmethod
+    def _splitcmdline(value):
+        """ Split a kernel command line into parameters, the way the kernel's
+            own next_arg() does: on whitespace, except inside double quotes.
+
+            Each parameter is returned verbatim, quotes and all, so that
+            rejoining them reproduces what was written apart from the runs of
+            whitespace between parameters.
+        """
+        items = []
+        current = []
+        quoted = False
+        for char in value:
+            if char == '"':
+                quoted = not quoted
+                current.append(char)
+            elif char.isspace() and not quoted:
+                if current:
+                    items.append(''.join(current))
+                    current = []
+            else:
+                current.append(char)
+        if current:
+            items.append(''.join(current))
+        return items
+
+    @staticmethod
+    def _hasarg(cmdline, prefixes):
+        """ Whether the command line sets any of these parameters.
+
+            Only the start of a parameter counts, so a prefix appearing
+            inside the value of another parameter does not match.
+        """
+        return any(arg.startswith(prefix) for arg in cmdline for prefix in prefixes)
+
+    @staticmethod
+    def _inroot(root, path):
+        """ Resolve a path inside the image root the way the image itself
+            would see it, so that an absolute symlink such as
+            /etc/os-release -> /usr/lib/os-release stays inside the root
+            rather than landing on the build host's copy.
+
+            Returns None for a symlink loop.
+        """
+        root = Path(root)
+        parts = list(Path(str(path).lstrip('/')).parts)
+        current = root
+        hops = 0
+        while parts:
+            part = parts.pop(0)
+            if part == '..':
+                if current != root:
+                    current = current.parent
+                continue
+            candidate = current / part
+            if candidate.is_symlink():
+                hops += 1
+                if hops > 40:
+                    return None
+                target = os.readlink(candidate)
+                if target.startswith('/'):
+                    current = root
+                parts = list(Path(target.lstrip('/')).parts) + parts
+                continue
+            current = candidate
+        return current
+
+    def __str__(self):
+        if self.key:
+            return '%s (signed)' % self.output
+        return self.output
+
+    def _squashfsname(self, recipe):
+        """ The squashfs filename to boot, taken from the recipe's squashfs
+            artifact unless set explicitly.
+        """
+        if self.squashfs:
+            return self.squashfs
+
+        squashfs = [a for a in recipe.artifacts if isinstance(a, ArtifactSquashfs)]
+        if len(squashfs) == 0:
+            logging.error("UKI artifact has no squashfs artifact to boot, add one "
+                          "or set 'squashfs' on the UKI artifact")
+            raise RuntimeError
+        if len(squashfs) > 1:
+            logging.error("Recipe has several squashfs artifacts (%s), set 'squashfs' "
+                          "on the UKI artifact", ", ".join(a.output for a in squashfs))
+            raise RuntimeError
+        if squashfs[0].include:
+            logging.warning("The squashfs artifact %s only includes %s, which may not boot",
+                            squashfs[0].output, ", ".join(squashfs[0].include))
+        return squashfs[0].output
+
+    def _cmdline(self, recipe):
+        """ The kernel command line baked into the image.
+
+            The live root is derived from the image being built so the UKI
+            and the squashfs it boots are always the same build, and the
+            generic DHCP default fills in only when the recipe has not
+            configured the network itself.
+        """
+        cmdline = []
+
+        if not self._hasarg(self.kcmdline, ('root=',)):
+            cmdline.append('root=live:%s/images/%s/%s/%s' % (
+                self.url.rstrip('/'), recipe.name, recipe.tag, self._squashfsname(recipe)))
+            cmdline.append('rd.live.image')
+
+        if not self._hasarg(self.kcmdline, self.netargs):
+            cmdline.extend(self.def_netcmdline)
+
+        cmdline.extend(self.kcmdline)
+        return cmdline
+
+    def _findkver(self, recipe):
+        """ The kernel version to build for, from the image's /lib/modules.
+        """
+        if self.kver:
+            return self.kver
+
+        moddir = self._inroot(recipe.root, 'lib/modules')
+        kvers = sorted(entry.name for entry in moddir.glob('*')
+                       if (entry / 'kernel').is_dir() or (entry / 'modules.dep').exists())
+
+        if len(kvers) == 0:
+            logging.error("No kernel found in %s, cannot build a UKI", moddir)
+            raise RuntimeError
+        # Guessing here would silently ship a UKI holding the wrong kernel.
+        if len(kvers) > 1:
+            logging.error("Image has multiple kernels (%s), set 'kver' on the UKI artifact",
+                          ", ".join(kvers))
+            raise RuntimeError
+
+        logging.debug("Using kernel version %s for the UKI", kvers[0])
+        return kvers[0]
+
+    def _resolve(self, recipe, pattern, what):
+        """ Resolve a path or glob inside the image to a single host path.
+        """
+        paths = sorted(glob.glob(str(recipe.root) + '/' + pattern.lstrip('/')))
+        if len(paths) == 0:
+            logging.error("UKI %s '%s' did not match any file in the image", what, pattern)
+            raise RuntimeError
+        if len(paths) > 1:
+            logging.error("UKI %s '%s' matched more than one file: %s", what, pattern,
+                          ", ".join(os.path.basename(path) for path in paths))
+            raise RuntimeError
+        path = self._inroot(recipe.root, os.path.relpath(paths[0], recipe.root))
+        if path is None or not path.is_file():
+            logging.error("UKI %s '%s' does not resolve to a file in the image", what, pattern)
+            raise RuntimeError
+        return str(path)
+
+    def _findkernel(self, recipe, kver):
+        if self.kernel:
+            return self._resolve(recipe, self.kernel, 'kernel')
+        for pattern in self.kernelpaths:
+            path = self._inroot(recipe.root, pattern % kver)
+            if path is not None and path.is_file():
+                return str(path)
+        logging.error("No kernel image for %s in the image, set 'kernel' on the UKI artifact", kver)
+        raise RuntimeError
+
+    def _findstub(self, recipe):
+        if self.stub:
+            return self._resolve(recipe, self.stub, 'stub')
+        if recipe.architecture not in self.efiarch:
+            logging.error("Architecture %s has no known sd-stub, set 'stub' on the UKI artifact",
+                          recipe.architecture)
+            raise RuntimeError
+        return self._resolve(recipe,
+                             'usr/lib/systemd/boot/efi/linux%s.efi.stub' % self.efiarch[recipe.architecture],
+                             'stub')
+
+    def _findosrelease(self, recipe):
+        for pattern in self.osreleasepaths:
+            path = self._inroot(recipe.root, pattern)
+            if path is not None and path.is_file():
+                return str(path)
+        return None
+
+    def _buildinitrd(self, recipe, kver, scratch):
+        """ Run dracut in the container, where the image's own kernel modules
+            and dracut modules are the ones it finds, writing the initrd to a
+            host scratch directory so it never lands in the image root.
+        """
+        command = ["dracut", "--force", "--no-hostonly", "--no-machineid",
+                   "--kver", kver]
+        for module in self.dracutmodules:
+            command.extend(["--add", module])
+        command.extend(self.dracutargs)
+        command.append(self.scratchmount + '/initrd.img')
+
+        logging.info("Building initrd for kernel %s in container %s", kver, recipe.container)
+        # The container filesystem does not carry the xattrs dracut tries to
+        # preserve, which is harmless but buries real errors in warnings.
+        rc = runcmd(["buildah", "run",
+                     "--volume", "%s:%s:Z" % (scratch, self.scratchmount),
+                     "--env", "DRACUT_NO_XATTR=1",
+                     recipe.container, "--"] + command)
+        if rc:
+            logging.error("dracut failed to build an initrd for kernel %s", kver)
+            raise RuntimeError
+        return os.path.join(scratch, 'initrd.img')
+
+    def run(self, recipe):
+        outfile = recipe.outputdir() / self.output
+
+        kver = self._findkver(recipe)
+        kernel = self._findkernel(recipe, kver)
+        stub = self._findstub(recipe)
+        osrelease = self._findosrelease(recipe)
+        cmdline = self._cmdline(recipe)
+
+        with tempfile.TemporaryDirectory(prefix='phoenix-uki-') as scratch:
+            if self.initrd:
+                initrd = self._resolve(recipe, self.initrd, 'initrd')
+            else:
+                initrd = self._buildinitrd(recipe, kver, scratch)
+
+            # ukify collapses every run of whitespace in a command line given
+            # as an argument, including inside quotes, which would rewrite a
+            # parameter such as module.param="a  b". It copies a command line
+            # read from a file verbatim, so pass one.
+            cmdlinefile = os.path.join(scratch, 'cmdline')
+            with open(cmdlinefile, 'w') as cfile:
+                cfile.write(" ".join(cmdline))
+
+            command = ["ukify", "build",
+                       "--linux", kernel,
+                       "--initrd", initrd,
+                       "--stub", stub,
+                       "--uname", kver,
+                       "--cmdline", "@%s" % cmdlinefile,
+                       "--output", str(outfile),
+                       ]
+            if recipe.architecture in self.efiarch:
+                command.extend(["--efi-arch", self.efiarch[recipe.architecture]])
+
+            # ukify falls back to the build host's os-release without this.
+            # Carries IMAGE_ID and IMAGE_VERSION when the recipe used an
+            # osrelease step, which is how a booted node reports which image
+            # and tag it is running.
+            if osrelease:
+                command.extend(["--os-release", "@%s" % osrelease])
+            else:
+                logging.warning("Image has no os-release, the UKI will carry an empty one")
+                command.extend(["--os-release", ""])
+
+            if self.key:
+                # Passing --sign-kernel or --no-sign-kernel explicitly also
+                # avoids ukify running sbverify to decide for itself, and
+                # sbsigntools is not packaged for RHEL 10.
+                command.extend(["--signtool", self.signtool,
+                                "--sign-kernel" if self.signkernel else "--no-sign-kernel",
+                                "--secureboot-private-key", self.key,
+                                "--secureboot-certificate", self.cert,
+                                ])
+
+            logging.info("Building %s UKI %s for kernel %s",
+                         'signed' if self.key else 'unsigned', outfile, kver)
+            logging.debug("UKI command line: %s", " ".join(cmdline))
+            rc = runcmd(command)
+            if rc:
+                # A partial file here would look like a usable boot image.
+                try:
+                    outfile.unlink()
+                except FileNotFoundError:
+                    pass
+                logging.error("Could not create the UKI %s", outfile)
+                raise RuntimeError
+
+        os.chmod(outfile, 0o644)
+        logging.info("Created %s", outfile)
 
 class ArtifactPush(Artifact):
     """ Push the built image to a container registry with buildah push.

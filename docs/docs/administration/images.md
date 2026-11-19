@@ -152,6 +152,7 @@ repos:
 | file      | A path or list of paths to copy                    |
 | initramfs | Creates a gzip'ed cpio of the image root (boolean) |
 | squashfs  | Creates a squashfs of the image root. Optionally specify `output` to control the generated filename or `include` to limit what paths are included |
+| uki       | Builds a Unified Kernel Image, a single signed EFI binary holding the kernel, the initrd, and the kernel command line, for booting over HTTP Boot without iPXE. See below |
 | push      | Commits the image and pushes it to a container registry with `buildah push`. A string specifies the registry. A mapping accepts `registry` (required), `image` to override the repository name (defaults to the recipe name), `tag` to override the destination tag (defaults to the build tag), and `format` to select the manifest type (`oci`, `docker`, `v2s2`, or `v2s1`) |
 
 Setting `tag` replaces the build tag rather than adding to it. It may be a
@@ -162,6 +163,116 @@ pushes only upload a manifest.
 
 Buildah must already be logged into the registry used by the `push` artifact;
 Phoenix does not run `buildah login`.
+
+#### UKI
+
+A Unified Kernel Image is one EFI binary containing the kernel, the initrd,
+the kernel command line, and `os-release`. Firmware loads it directly over
+HTTP Boot, so no iPXE and no per-node bootfile is involved. With Secure Boot
+on, the command line inside the signed binary is the only one used and cannot
+be edited at the console. With Secure Boot off, the stub accepts a command line
+passed by the firmware or boot loader instead.
+
+The image needs a kernel, `dracut`, the dracut modules for a live network
+root (`dracut-live` and `dracut-network`), and `systemd-boot-unsigned` for
+the EFI stub. `systemd-ukify` must be installed on the build node.
+
+```yaml
+artifacts:
+  - squashfs: true
+  - uki:
+      url: http://boot.example.com:8000
+      kcmdline:
+        - console=ttyS0,115200n8
+      key: /etc/phoenix/secureboot/db.key
+      cert: /etc/phoenix/secureboot/db.crt
+```
+
+| Option    | Description                                        |
+| :---------| :--------------------------------------------------|
+| output    | The artifact filename, defaulting to `uki.efi`. The artifact directory is already keyed by image name and build tag, so leaving this alone keeps the boot URL predictable |
+| url       | Base URL the nodes fetch artifacts from. Required unless `kcmdline` supplies its own `root=` |
+| squashfs  | The squashfs filename to boot. Defaults to the `output` of the recipe's `squashfs` artifact, and must be set if the recipe has none or more than one |
+| kcmdline  | A string or list of additional kernel parameters |
+| kver      | The kernel version to build for. Defaults to the only kernel in the image, and it is an error for an image to hold more than one without setting this |
+| kernel    | The kernel image, a path or glob relative to the image root. Defaults to the first of `/lib/modules/<kver>/vmlinuz`, `/boot/vmlinuz-<kver>`, and `/boot/Image-<kver>` that exists, which covers RHEL and SLES |
+| initrd    | Reuse an initrd already in the image, such as `/boot/initramfs-*.img`, rather than running dracut again. A path or glob relative to the image root |
+| dracutmodules | Dracut modules to add, defaulting to `dmsquash-live` and `livenet`. Setting this replaces the defaults rather than adding to them, so include those two when booting a live network root |
+| dracutargs | Extra arguments for the dracut invocation |
+
+`dracutmodules` and `dracutargs` are ignored when `initrd` is set. An
+unrecognized option is warned about rather than silently ignored. The artifact
+may also be given as just the URL, taking every other default:
+
+```yaml
+  - uki: http://boot.example.com:8000
+```
+| stub      | The EFI stub to wrap, defaulting to the one in the image for the target architecture |
+| key, cert | A PEM private key and certificate to sign with. Both are required together, and the paths are on the build node, not in the image |
+| signkernel | Whether to also sign the kernel inside the UKI. Defaults to true when signing |
+| signtool  | The ukify signing backend, `systemd-sbsign` (the default) or `sbsign`. RHEL 10 does not package `sbsign` |
+
+Signing is optional, so an image can be built and booted on a machine with
+Secure Boot off before any keys exist. The certificate must be enrolled in
+the firmware db for a signed image to boot with Secure Boot on.
+
+The command line is assembled from the image being built, so the UKI and the
+squashfs it boots are always from the same build:
+
+```
+root=live:<url>/images/<recipe>/<tag>/rootdir.squashfs rd.live.image ip=dhcp rd.neednet=1 <kcmdline>
+```
+
+The `root=` and `rd.live.image` defaults are omitted if `kcmdline` already
+sets a `root=`, and the `ip=` and `rd.neednet=` defaults are omitted if
+`kcmdline` contains any of `ip=`, `bond=`, `vlan=`, `bridge=`, `team=`,
+`bootdev=`, `BOOTIF=`, or `rd.neednet=`. Only the
+start of a parameter counts, so one of those appearing inside the value of
+another parameter does not count as setting it.
+
+`kcmdline` given as a string is split into parameters the way the kernel
+splits its own command line, on whitespace outside of double quotes, and
+each parameter is embedded exactly as written. A value containing spaces
+keeps them:
+
+```yaml
+      kcmdline: nvidia.NVreg_RegistryDwords="RMNvLinkSpeedControl=1 Foo=2"
+```
+
+`dracutargs` is an argument vector rather than a kernel command line, so a
+string is split the way a shell would and the quotes are consumed. These are
+equivalent:
+
+```yaml
+      dracutargs: --add-driver "squashfs loop overlay"
+
+      dracutargs:
+        - --add-driver
+        - squashfs loop overlay
+```
+
+A UKI is built once per image rather than once per node, so the default
+network configuration is a generic `ip=dhcp` across every interface. Where
+the interfaces that nodes boot on are known, naming them is better:
+
+```yaml
+  - uki:
+      url: http://boot.example.com:8000
+      kcmdline: ip=eno1:dhcp ip=eno2:dhcp rd.neednet=1 console=ttyS0,115200n8
+```
+
+The initrd is built inside the container, so the image's own kernel modules
+and dracut modules are the ones dracut finds. It is written to a scratch
+directory on the build node rather than into the image root, and `ukify` also
+runs on the build node, so neither the generated initrd nor the signing key
+ends up where a `squashfs` or `push` artifact ordered after the UKI would
+capture it.
+
+The UKI's `.osrel` section is taken from the image's `/etc/os-release`, or
+`/usr/lib/os-release` if that is missing, never from the build node. An
+`osrelease` step before the artifact carries `IMAGE_ID` and `IMAGE_VERSION`
+into it, which is how a booted node reports which image and tag it is
+running.
 
 ### Example Recipe
 
