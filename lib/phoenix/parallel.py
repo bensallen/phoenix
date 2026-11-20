@@ -90,7 +90,8 @@ class PopulationRunTimer(RunTimer):
             pending = '  Pending:{}'.format(self.total - known)
         else:
             pending = ''
-        towrite = "  ".join(['{}:{}'.format(k,v) for k,v in Counter(statevalues).items()]) + '{}\r'.format(pending)
+        towrite = "  ".join(['{}:{}'.format(k.decode(errors='replace') if isinstance(k, bytes) else k, v)
+                             for k,v in Counter(statevalues).items()]) + '{}\r'.format(pending)
         self.erase_line()
         self.wholelen = len(towrite)
         sys.stderr.write(towrite)
@@ -115,6 +116,13 @@ class PopulationOutputHandler(GatherOutputHandler):
             self._runtimer_clean()
             self._display.print_line_error(node, msg)
             self._runtimer_set_dirty()
+
+    def _runtimer_finalize(self, worker):
+        """Erase the progress line so it is not left under the results"""
+        if self._runtimer:
+            self._runtimer.eh.erase_line()
+            self._runtimer.invalidate()
+            self._runtimer = None
 
     def ev_close(self, worker, timedout):
         # Worker is closing -- it's time to gather results...
