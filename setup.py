@@ -130,7 +130,7 @@ setup(name = 'phoenix',
     author_email = 'ezellma@ornl.gov',
     url = 'https://gitlab.ccs.ornl.gov/hpc-admins/phoenix',
     package_dir={'': 'lib'},
-    packages = [ 'phoenix', 'phoenix.bootloader', 'phoenix.command', 'phoenix.datasource', 'phoenix.dhcp', 'phoenix.oob', 'phoenix.plugins' ],
+    packages = [ 'phoenix', 'phoenix.bootloader', 'phoenix.command', 'phoenix.datasource', 'phoenix.dhcp', 'phoenix.filesync', 'phoenix.oob', 'phoenix.plugins' ],
     package_data = { 'phoenix': ['templates/*.j2'] },
     scripts = ['bin/%s' % x for x in scripts],
     cmdclass = { 'bdist_rpm': bdist_rpm_custom, 'sdist': CustomSdist, 'generate_man': GenerateMan },
@@ -141,6 +141,6 @@ setup(name = 'phoenix',
                    ('/var/opt/phoenix/data', []),
                    ('/etc/clustershell/groups.conf.d', ['contrib/clustershell/phoenix.conf']),
                    ('/usr/lib/systemd/system', ['contrib/pxbootfile.service', 'contrib/pxdhcpmon.service']),
-                   ('/etc/sysconfig', ['contrib/sysconfig/pxdhcpmon'])
+                   ('/etc/sysconfig', ['contrib/sysconfig/pxbootfile', 'contrib/sysconfig/pxdhcpmon'])
                  ],
     )
