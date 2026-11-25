@@ -199,6 +199,10 @@ artifacts:
 | initrd    | Reuse an initrd already in the image, such as `/boot/initramfs-*.img`, rather than running dracut again. A path or glob relative to the image root |
 | dracutmodules | Dracut modules to add, defaulting to `dmsquash-live` and `livenet`. Setting this replaces the defaults rather than adding to them, so include those two when booting a live network root |
 | dracutargs | Extra arguments for the dracut invocation |
+| stub      | The EFI stub to wrap, a path or glob relative to the image root. Defaults to `/usr/lib/systemd/boot/efi/linux<arch>.efi.stub`, where `<arch>` is `x64` on x86_64 and `aa64` on aarch64 |
+| key, cert | A PEM private key and certificate to sign with. Both are required together, and the paths are on the build node, not in the image |
+| signkernel | Whether to also sign the kernel inside the UKI. Defaults to true when signing |
+| signtool  | The ukify signing backend, `sbsign` (the default) or `systemd-sbsign` |
 
 `dracutmodules` and `dracutargs` are ignored when `initrd` is set. An
 unrecognized option is warned about rather than silently ignored. The artifact
@@ -207,10 +211,6 @@ may also be given as just the URL, taking every other default:
 ```yaml
   - uki: http://boot.example.com:8000
 ```
-| stub      | The EFI stub to wrap, defaulting to the one in the image for the target architecture |
-| key, cert | A PEM private key and certificate to sign with. Both are required together, and the paths are on the build node, not in the image |
-| signkernel | Whether to also sign the kernel inside the UKI. Defaults to true when signing |
-| signtool  | The ukify signing backend, `systemd-sbsign` (the default) or `sbsign`. RHEL 10 does not package `sbsign` |
 
 Signing is optional, so an image can be built and booted on a machine with
 Secure Boot off before any keys exist. The certificate must be enrolled in
@@ -269,10 +269,7 @@ ends up where a `squashfs` or `push` artifact ordered after the UKI would
 capture it.
 
 The UKI's `.osrel` section is taken from the image's `/etc/os-release`, or
-`/usr/lib/os-release` if that is missing, never from the build node. An
-`osrelease` step before the artifact carries `IMAGE_ID` and `IMAGE_VERSION`
-into it, which is how a booted node reports which image and tag it is
-running.
+`/usr/lib/os-release` if that is missing.
 
 ### Example Recipe
 

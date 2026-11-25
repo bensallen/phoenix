@@ -432,7 +432,7 @@ class Recipe(object):
             logging.error("You must specify initpackages when building from scratch")
             return
         for artifact in self.artifacts:
-            artifact.check()
+            artifact.check(self)
         logging.info("Building recipe %s with tag %s", self.name, self.tag)
 
         with ConfirmKeyboardInterrupt():
@@ -823,10 +823,10 @@ class StepOsRelease(Step):
             raise RuntimeError
 
 class Artifact(object):
-    def check(self):
-        """ Verify the build host can produce this artifact. Runs before the
-            image is built so a missing tool fails fast rather than after a
-            long build.
+    def check(self, recipe):
+        """ Verify the build host and recipe can produce this artifact. Runs
+            before the image is built so a problem fails fast rather than
+            after a long build.
         """
         pass
 
@@ -963,7 +963,7 @@ class ArtifactUki(Artifact):
                     built and tested before any keys exist.
           signkernel: also sign the kernel inside the UKI, default true
                     when signing
-          signtool: ukify signing backend, 'systemd-sbsign' or 'sbsign'
+          signtool: ukify signing backend, 'sbsign' or 'systemd-sbsign'
 
         The initrd is built inside the container so the image's own kernel
         modules and dracut modules are the ones dracut finds, but ukify runs
@@ -990,7 +990,10 @@ class ArtifactUki(Artifact):
 
     osreleasepaths = ('etc/os-release', 'usr/lib/os-release')
 
-    signtools = ('systemd-sbsign', 'sbsign')
+    # sbsign is the only backend available on every supported build host.
+    # systemd-sbsign needs systemd 257 or later, so not RHEL 9 or SLES 15.
+    signtools = {'sbsign': ('sbsign', None),
+                 'systemd-sbsign': ('systemd-sbsign', '/usr/lib/systemd/systemd-sbsign')}
 
     # Fetching the root over HTTP needs the live root modules and a network
     # brought up in the initrd.
@@ -1021,7 +1024,7 @@ class ArtifactUki(Artifact):
         self.key = None
         self.cert = None
         self.signkernel = None
-        self.signtool = 'systemd-sbsign'
+        self.signtool = 'sbsign'
         self.kcmdline = []
         self.dracutmodules = list(self.def_dracutmodules)
         self.dracutargs = []
@@ -1082,13 +1085,24 @@ class ArtifactUki(Artifact):
                           "or a root= in its kcmdline")
             raise RuntimeError
 
-    def check(self):
+    def check(self, recipe):
+        if not self._hasarg(self.kcmdline, ('root=',)):
+            self._squashfsname(recipe)
+        if not self.stub and recipe.architecture not in self.efiarch:
+            logging.error("Architecture %s has no known sd-stub, set 'stub' on the UKI artifact",
+                          recipe.architecture)
+            raise RuntimeError
         if shutil.which('ukify') is None:
             logging.error("UKI artifact needs ukify, from systemd-ukify, on the build host")
             raise RuntimeError
         for path, what in ((self.key, 'key'), (self.cert, 'cert')):
             if path and not os.access(path, os.R_OK):
                 logging.error("UKI %s %s is not readable", what, path)
+                raise RuntimeError
+        if self.key:
+            name, fallback = self.signtools[self.signtool]
+            if shutil.which(name) is None and not (fallback and os.access(fallback, os.X_OK)):
+                logging.error("UKI signtool %s is not installed on the build host", self.signtool)
                 raise RuntimeError
 
     @staticmethod
@@ -1242,6 +1256,9 @@ class ArtifactUki(Artifact):
             return self.kver
 
         moddir = self._inroot(recipe.root, 'lib/modules')
+        if moddir is None or not moddir.is_dir():
+            logging.error("No /lib/modules in the image, cannot build a UKI")
+            raise RuntimeError
         kvers = sorted(entry.name for entry in moddir.glob('*')
                        if (entry / 'kernel').is_dir() or (entry / 'modules.dep').exists())
 
@@ -1300,7 +1317,9 @@ class ArtifactUki(Artifact):
             path = self._inroot(recipe.root, pattern)
             if path is not None and path.is_file():
                 return str(path)
-        return None
+        logging.error("The image has no /etc/os-release or /usr/lib/os-release, which the "
+                      "UKI needs for its .osrel section")
+        raise RuntimeError
 
     def _buildinitrd(self, recipe, kver, scratch):
         """ Run dracut in the container, where the image's own kernel modules
@@ -1361,19 +1380,11 @@ class ArtifactUki(Artifact):
                 command.extend(["--efi-arch", self.efiarch[recipe.architecture]])
 
             # ukify falls back to the build host's os-release without this.
-            # Carries IMAGE_ID and IMAGE_VERSION when the recipe used an
-            # osrelease step, which is how a booted node reports which image
-            # and tag it is running.
-            if osrelease:
-                command.extend(["--os-release", "@%s" % osrelease])
-            else:
-                logging.warning("Image has no os-release, the UKI will carry an empty one")
-                command.extend(["--os-release", ""])
+            command.extend(["--os-release", "@%s" % osrelease])
 
             if self.key:
-                # Passing --sign-kernel or --no-sign-kernel explicitly also
-                # avoids ukify running sbverify to decide for itself, and
-                # sbsigntools is not packaged for RHEL 10.
+                # An explicit --sign-kernel or --no-sign-kernel stops ukify
+                # running a verify tool to decide for itself.
                 command.extend(["--signtool", self.signtool,
                                 "--sign-kernel" if self.signkernel else "--no-sign-kernel",
                                 "--secureboot-private-key", self.key,
